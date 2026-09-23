@@ -1,0 +1,58 @@
+{
+  "skill_name": "dev-agentes",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Vou soltar 4 subagentes em paralelo para fechar as issues de validação de CPF, paginação da listagem, e-mail de boas-vindas e o ajuste no cálculo de frete. É um projeto FastAPI com pytest e Postgres. Escreve o briefing que cada um vai receber.",
+      "expected_output": "Briefings com escopo fechado por arquivo, uma worktree por agente a partir de origin/main, testes só do que mudou enquanto itera e o portão uma vez no fim, workers do xdist limitados por agente, teto de 10 minutos por conferência, nada de serviço pago ou externo real, PR em rascunho com um push só, esperar CI sem sleep, relatório curto.",
+      "files": [],
+      "expectations": [
+        "Cada briefing lista os arquivos ou a área que o agente pode tocar e diz o que fazer com o que sobrar (pendência, sem conserto).",
+        "Os briefings mandam rodar só os testes dos arquivos mexidos enquanto itera e a suíte completa ou o portão uma vez no fim.",
+        "Os briefings limitam os workers do pytest-xdist por agente (número fixo ou variável de ambiente), em vez de -n auto em todos.",
+        "Os briefings põem um teto de tempo para conferência lenta (da ordem de 10 minutos) ou proíbem teste lento em laço.",
+        "Os briefings proíbem chamada paga ou serviço externo real sem pedido explícito.",
+        "Cada agente trabalha numa worktree própria criada a partir de um ponto explícito (origin/main), ou o texto explica como evitar dois agentes no mesmo diretório.",
+        "Os briefings pedem PR em rascunho, ou um push só no fim, e relatório curto."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "meus agentes tão demorando uma eternidade, um deles ficou quase uma hora parado no pytest e ninguém sabe por quê. os transcripts tão em ~/.claude/projects/-srv-loja/4b1e/subagents/. descobre onde o tempo tá indo e o que eu mudo",
+      "expected_output": "Roda mede_agente.py na pasta de subagentes, lê a divisão de tempo por categoria, as chamadas mais lentas e as penduradas, e recomenda lock_timeout/statement_timeout nas conexões de teste, pytest-timeout, testes só do que mudou, workers por agente e selo no pre-push conforme o que a medida mostrar.",
+      "files": [],
+      "expectations": [
+        "A resposta mede os transcripts com o mede_agente.py da skill (ou lê o JSONL por tempo entre tool_use e tool_result) em vez de só especular.",
+        "A resposta separa o tempo por categoria (testes, portão, leitura, git, edição) ou aponta as chamadas mais lentas e as penduradas.",
+        "Para o pytest parado, a resposta cita lock de banco como causa provável e recomenda lock_timeout e statement_timeout por conexão de teste e pytest-timeout.",
+        "A resposta recomenda limitar os workers do xdist por agente quando há vários agentes na mesma máquina.",
+        "A resposta recomenda rodar só os testes do que mudou enquanto itera e o portão uma vez no fim."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Renomeei 40 funções de teste e limpei docstrings em uns 25 arquivos de src/ numa branch. Como eu provo pro revisor que não mudei comportamento nenhum? E tem umas 60 trocas de texto que ainda faltam aplicar em vários arquivos.",
+      "expected_output": "Usa mesmo_ast.py --ref main para provar que só comentário, docstring e nome de teste mudaram, explica as linhas CÓDIGO/DUPLICA/REFERÊNCIA, e aplica as 60 trocas com troca.py num JSON só (tudo ou nada, recusa ambíguo), sem heredoc de Python.",
+      "files": [],
+      "expectations": [
+        "A resposta usa mesmo_ast.py (comparação de AST contra a ref) como prova, não só o diff ou os testes passando.",
+        "A resposta explica que referência órfã ao nome antigo e teste duplicado depois do renomeio são acusados.",
+        "As 60 trocas vão num JSON aplicado pelo troca.py, com a garantia de tudo ou nada e recusa de ocorrência ambígua.",
+        "A resposta não propõe heredoc de Python com replace/write_text para editar os arquivos."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "O painel admin tá lento em produção. Quero ver quais queries do Postgres pesam mais. Pode olhar?",
+      "expected_output": "Antes de conectar, diz qual banco, por qual conexão e que só lê estatísticas, e pede o sim. Explica que ligar pg_stat_statements pede shared_preload_libraries e reinício, e que zerar é outro sim, ambos feitos por humano. Prefere dev com volume parecido ou prod só leitura agregada, roda pg_top.py com --alvo e --confirmo só depois do sim, explica total vs média, chamadas, linhas por chamada e acerto de cache, e mede antes e depois com a mesma carga.",
+      "files": [],
+      "expectations": [
+        "A resposta não conecta ao banco antes de dizer qual banco, por qual conexão e que só lê, e de receber um sim explícito.",
+        "A resposta trata ligar a extensão (shared_preload_libraries, reinício) e zerar as estatísticas como passos separados, feitos por humano com sim próprio.",
+        "A resposta usa uma sessão só de leitura com statement_timeout (por exemplo o pg_top.py) e não roda CREATE EXTENSION, ALTER SYSTEM nem pg_stat_statements_reset por conta própria.",
+        "A resposta explica a diferença entre tempo total e tempo médio e o que chamadas altas com poucas linhas por chamada indicam (N+1).",
+        "A resposta recomenda medir antes e depois com a mesma carga e a mesma janela, e avisa que dev com pouco dado engana."
+      ]
+    }
+  ]
+}
