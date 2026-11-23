@@ -34,7 +34,22 @@ python $S/mede_agente.py pasta/ --json > medidas.json
 No `--json` há ainda `bytes_de_resultado` por ferramenta: qual ferramenta mais encheu o contexto.
 
 A tabela de preços (`PRECO_POR_MTOK`) é a pública na data em que o script foi escrito; confira e
-atualize quando os preços mudarem.
+atualize quando os preços mudarem. Cada linha tem a entrada, a saída e o fator da leitura de cache
+(0,1 na maioria, 0,05 no Opus 5.5, 0,025 no Fable 5.1), e vale o prefixo mais longo que casa com o
+id do modelo: `claude-opus-5-5` não cai no preço do `claude-opus-5`. A escrita de cache de 1 hora
+conta 2x a entrada e a de 5 minutos, 1,25x.
+
+Modelo fora da tabela não vira custo zero: o `custo_usd` do agente fica vazio, o `--json` traz
+`sem_preco` (modelo e requisições) e `custo_parcial_usd` (só o que tem preço), e sai um aviso no
+stderr. Para dar o preço sem editar o script:
+
+```bash
+python $S/mede_agente.py pasta/ --preco claude-fable-5-2=10,50,0.025   # entrada,saída[,leitura]
+MEDE_AGENTE_PRECOS=precos.json python $S/mede_agente.py pasta/         # {"modelo": [10, 50, 0.025]}
+```
+
+A linha de comando passa por cima do arquivo, e o arquivo, da tabela. O preço do
+`claude-fable-5-2` na tabela é o do Fable 5.1, assumido: o script avisa toda vez que o usa.
 
 ## O tempo
 
@@ -50,6 +65,12 @@ PENDURADAS (sem resultado, ou a 90% do prazo)
   próximo. É o tempo pensando e escrevendo.
 - **ferramentas**: soma de `tool_use` até `tool_result`. Chamadas em paralelo se sobrepõem, então a
   soma pode passar da parede.
+- **segundo plano**: o `tool_result` de um comando com `run_in_background` chega na hora, só com o
+  id da tarefa. O tempo dele vai do `tool_use` até a notificação de fim da tarefa, entra nas
+  categorias e nas mais lentas com a marca `[2º plano]`, e a soma fica em `segundo_plano_s` no
+  `--json`. O agente pode trabalhar enquanto o comando roda: este tempo se sobrepõe ao do modelo e
+  ao das outras ferramentas. Sem notificação (servidor que fica no ar, sessão interrompida), a
+  chamada aparece nas penduradas como `2º plano sem fim`.
 - **categorias**: o comando do Bash é classificado por regex, na ordem: `portão` (`just pronto`,
   `pronto.py`, `pre-commit run`, `make check`, `tox`, `nox`), `testes` (pytest, npm test, go test,
   cargo test...), `lint/tipos`, `git`, `leitura` (grep, cat, sed -n...), `bash (outro)`. As outras

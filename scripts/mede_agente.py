@@ -1,6 +1,7 @@
 import argparse
 import collections
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -14,14 +15,28 @@ CHAVES_DE_USO = (
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
 )
-PRECO_POR_MTOK = {
-    "claude-opus-5": (5.0, 25.0),
-    "claude-sonnet-5": (2.0, 10.0),
-    "claude-haiku-4-5": (1.0, 5.0),
-}
+# US$ por MTok: (entrada, saída, fator da leitura de cache sobre a entrada). Vale o prefixo mais
+# longo que casa com o id do modelo. `--preco` e o arquivo de MEDE_AGENTE_PRECOS passam por cima.
+type Preco = tuple[float, float, float]
 LEITURA_DE_CACHE = 0.1
-ESCRITA_DE_CACHE = 1.25
+PRECO_POR_MTOK: dict[str, Preco] = {
+    "claude-fable-5-2": (10.0, 50.0, 0.025),
+    "claude-fable-5-1": (10.0, 50.0, 0.025),
+    "claude-fable-5": (10.0, 50.0, LEITURA_DE_CACHE),
+    "claude-opus-5-5": (4.0, 20.0, 0.05),
+    "claude-opus-5": (5.0, 25.0, LEITURA_DE_CACHE),
+    "claude-sonnet-5": (2.0, 10.0, LEITURA_DE_CACHE),
+    "claude-haiku-5-5": (0.1, 0.5, LEITURA_DE_CACHE),
+    "claude-haiku-4-5": (1.0, 5.0, LEITURA_DE_CACHE),
+}
+# Preço que não veio de tabela publicada: o custo sai, com aviso de onde o número veio.
+PRECO_ASSUMIDO = {"claude-fable-5-2": "o do Fable 5.1"}
+VARIAVEL_PRECOS = "MEDE_AGENTE_PRECOS"
+ESCRITA_DE_CACHE = 1.25  # TTL de 5 minutos
+ESCRITA_DE_CACHE_1H = 2.0
 PRAZO_PADRAO_BASH_S = 120.0
+EM_SEGUNDO_PLANO = re.compile(r"Command running in background with ID: (\w+)")
+FIM_DE_TAREFA = re.compile(r"<task-id>([^<]+)</task-id>")
 
 CATEGORIAS_DE_COMANDO: tuple[tuple[str, str], ...] = (
     (
@@ -56,19 +71,41 @@ class Chamada:
     resumo: str
     segundos: float | None
     prazo_s: float | None
+    segundo_plano: bool = False
 
 
-def custo_usd(modelo: str, uso: dict) -> float | None:
-    """Estima o custo de uma requisição pela tabela pública, com cache de 5 minutos."""
-    preco = next((v for k, v in PRECO_POR_MTOK.items() if modelo.startswith(k)), None)
+def preco_de(modelo: str, precos: dict[str, Preco] | None = None) -> Preco | None:
+    """O preço do prefixo mais longo que casa com o id do modelo, ou None."""
+    tabela = PRECO_POR_MTOK if precos is None else precos
+    casam = [prefixo for prefixo in tabela if modelo.startswith(prefixo)]
+    return tabela[max(casam, key=len)] if casam else None
+
+
+def custo_usd(modelo: str, uso: dict, precos: dict[str, Preco] | None = None) -> float | None:
+    """Estima o custo de uma requisição pela tabela de preços, ou None sem preço para o modelo.
+
+    A escrita de cache de 1 hora (`cache_creation.ephemeral_1h_input_tokens`) conta 2x a entrada;
+    o resto da escrita, 1,25x. Requisição sem token nenhum custa zero em qualquer modelo.
+    """
+    criado = uso.get("cache_creation_input_tokens") or 0
+    lido = uso.get("cache_read_input_tokens") or 0
+    entrada_tokens = uso.get("input_tokens") or 0
+    saida_tokens = uso.get("output_tokens") or 0
+    if not (criado or lido or entrada_tokens or saida_tokens):
+        return 0.0
+    preco = preco_de(modelo, precos)
     if preco is None:
         return None
-    entrada, saida = preco
+    entrada, saida, leitura = preco
+    detalhe = uso.get("cache_creation")
+    de_1h = (detalhe.get("ephemeral_1h_input_tokens") or 0) if isinstance(detalhe, dict) else 0
+    de_1h = min(de_1h, criado)
     return (
-        (uso.get("input_tokens") or 0) * entrada
-        + (uso.get("cache_read_input_tokens") or 0) * entrada * LEITURA_DE_CACHE
-        + (uso.get("cache_creation_input_tokens") or 0) * entrada * ESCRITA_DE_CACHE
-        + (uso.get("output_tokens") or 0) * saida
+        entrada_tokens * entrada
+        + lido * entrada * leitura
+        + (criado - de_1h) * entrada * ESCRITA_DE_CACHE
+        + de_1h * entrada * ESCRITA_DE_CACHE_1H
+        + saida_tokens * saida
     ) / 1_000_000
 
 
@@ -96,14 +133,32 @@ def _prazo(ferramenta: str, entrada: dict) -> float | None:
     return float(prazo_ms) / 1000 if isinstance(prazo_ms, int | float) else PRAZO_PADRAO_BASH_S
 
 
-def mede(caminho: Path, regras: tuple[tuple[str, re.Pattern[str]], ...] | None = None) -> dict:
+def _tarefa_de_fundo(evento: dict, bloco: dict) -> str | None:
+    """O id da tarefa quando o resultado só avisa que o comando foi para o segundo plano."""
+    resultado = evento.get("toolUseResult")
+    if isinstance(resultado, dict) and resultado.get("backgroundTaskId"):
+        return str(resultado["backgroundTaskId"])
+    achado = EM_SEGUNDO_PLANO.search(json.dumps(bloco.get("content"), ensure_ascii=False))
+    return achado.group(1) if achado else None
+
+
+def mede(
+    caminho: Path,
+    regras: tuple[tuple[str, re.Pattern[str]], ...] | None = None,
+    precos: dict[str, Preco] | None = None,
+) -> dict:
     """Resume o transcript JSONL de um agente do Claude Code: tokens, ferramentas, imagens e tempo.
 
     O tempo de ferramenta vai do `tool_use` ao `tool_result`; o do modelo, de cada resultado
     (ou pedido) à última mensagem do assistente antes do próximo. Chamadas em paralelo se
     sobrepõem, então a soma das ferramentas pode passar do tempo de parede.
+
+    Comando em segundo plano: o `tool_result` chega na hora, só com o id da tarefa. O tempo dele
+    vai do `tool_use` até o primeiro evento com a notificação de fim (`<task-id>` da tarefa); sem
+    notificação, fica sem resultado, como chamada pendurada.
     """
     regras = compila(CATEGORIAS_DE_COMANDO) if regras is None else regras
+    em_fundo: dict[str, tuple[datetime | None, str, str, str]] = {}
     ultimo_por_requisicao: dict[str, tuple[str, dict]] = {}
     ferramentas: collections.Counter[str] = collections.Counter()
     bytes_por_ferramenta: collections.Counter[str] = collections.Counter()
@@ -126,6 +181,12 @@ def mede(caminho: Path, regras: tuple[tuple[str, re.Pattern[str]], ...] | None =
         inicio = inicio or instante
         fim = instante or fim
         quando = _instante(instante) if instante else None
+        if em_fundo and quando and "<task-id>" in linha:
+            for tarefa in FIM_DE_TAREFA.findall(linha):
+                if tarefa in em_fundo:
+                    t0, nome, categoria, resumo = em_fundo.pop(tarefa)
+                    segundos = (quando - t0).total_seconds() if t0 else None
+                    chamadas.append(Chamada(nome, categoria, resumo, segundos, None, True))
         mensagem = evento.get("message") or {}
         conteudo = mensagem.get("content")
         if evento.get("type") == "assistant":
@@ -168,20 +229,29 @@ def mede(caminho: Path, regras: tuple[tuple[str, re.Pattern[str]], ...] | None =
                 )
                 if id_ in abertas:
                     t0, nome, categoria, resumo, prazo = abertas.pop(id_)
+                    tarefa = _tarefa_de_fundo(evento, bloco) if nome == "Bash" else None
+                    if tarefa:
+                        em_fundo[tarefa] = (t0, nome, categoria, resumo)
+                        continue
                     segundos = (quando - t0).total_seconds() if quando and t0 else None
                     chamadas.append(Chamada(nome, categoria, resumo, segundos, prazo))
     if espera_desde and ultima_resposta and ultima_resposta > espera_desde:
         modelo_s += (ultima_resposta - espera_desde).total_seconds()
     for _, nome, categoria, resumo, prazo in abertas.values():
         chamadas.append(Chamada(nome, categoria, resumo, None, prazo))
+    for _, nome, categoria, resumo in em_fundo.values():
+        chamadas.append(Chamada(nome, categoria, resumo, None, None, True))
 
     total: collections.Counter[str] = collections.Counter()
     contextos = []
     custos = []
     modelos: collections.Counter[str] = collections.Counter()
+    sem_preco: collections.Counter[str] = collections.Counter()
     for modelo, uso in ultimo_por_requisicao.values():
         modelos[modelo] += 1
-        custos.append(custo_usd(modelo, uso))
+        custos.append(custo_usd(modelo, uso, precos))
+        if custos[-1] is None:
+            sem_preco[modelo] += 1
         for chave in CHAVES_DE_USO:
             total[chave] += uso.get(chave) or 0
         contextos.append(
@@ -200,6 +270,9 @@ def mede(caminho: Path, regras: tuple[tuple[str, re.Pattern[str]], ...] | None =
         "cache_criado": total["cache_creation_input_tokens"],
         "imagens_lidas": imagens,
         "custo_usd": None if None in custos else round(sum(c or 0 for c in custos), 4),
+        # Só das requisições com preço: igual ao `custo_usd` quando nenhum modelo ficou de fora.
+        "custo_parcial_usd": round(sum(c or 0 for c in custos), 4),
+        "sem_preco": dict(sem_preco),
         "modelos": dict(modelos),
         "ferramentas": dict(ferramentas.most_common()),
         "bytes_de_resultado": dict(bytes_por_ferramenta.most_common()),
@@ -209,6 +282,7 @@ def mede(caminho: Path, regras: tuple[tuple[str, re.Pattern[str]], ...] | None =
             "parede_s": round((t_fim - t_inicio).total_seconds(), 1) if t_inicio and t_fim else 0.0,
             "modelo_s": round(modelo_s, 1),
             "ferramentas_s": round(sum(c.segundos or 0 for c in chamadas), 1),
+            "segundo_plano_s": round(sum(c.segundos or 0 for c in chamadas if c.segundo_plano), 1),
             "chamadas": [c.__dict__ for c in chamadas],
         },
     }
@@ -269,7 +343,11 @@ def _imprime_tempo(medidas: list[dict], lentas: int, limiar: float) -> None:
             f"  {vezes:4d} chamadas  média {segundos / max(vezes, 1):5.0f}s"
         )
     todas = [
-        (c["segundos"], _nome(m["transcript"], 20), c["resumo"])
+        (
+            c["segundos"],
+            _nome(m["transcript"], 20),
+            ("[2º plano] " if c["segundo_plano"] else "") + c["resumo"],
+        )
         for m in medidas
         for c in m["tempo"]["chamadas"]
         if c["segundos"] is not None
@@ -283,7 +361,7 @@ def _imprime_tempo(medidas: list[dict], lentas: int, limiar: float) -> None:
         print(f"\nPENDURADAS (sem resultado, ou a {limiar:.0%} do prazo)")
         for transcript, c in achadas:
             quanto = (
-                "sem resultado"
+                ("2º plano sem fim" if c["segundo_plano"] else "sem resultado")
                 if c["segundos"] is None
                 else f"{c['segundos']:.0f}s de {c['prazo_s']:.0f}s"
             )
@@ -309,6 +387,54 @@ def _categoria(texto: str) -> tuple[str, str]:
     except re.error as erro:
         raise argparse.ArgumentTypeError(f"regex inválida: {erro}") from erro
     return nome, padrao
+
+
+def _preco(texto: str) -> tuple[str, Preco]:
+    modelo, sep, valores = texto.partition("=")
+    try:
+        numeros = [float(v) for v in valores.split(",")]
+    except ValueError:
+        numeros = []
+    if not sep or not modelo or len(numeros) not in (2, 3) or min(numeros, default=-1) < 0:
+        raise argparse.ArgumentTypeError(
+            "use MODELO=ENTRADA,SAIDA[,FATOR_DA_LEITURA_DE_CACHE] em US$ por MTok"
+        )
+    leitura = numeros[2] if len(numeros) == 3 else LEITURA_DE_CACHE
+    return modelo, (numeros[0], numeros[1], leitura)
+
+
+def precos_do_arquivo(caminho: Path) -> dict[str, Preco]:
+    """Lê `{"<prefixo do modelo>": [entrada, saída, fator da leitura de cache?]}` de um JSON."""
+    lido = json.loads(caminho.read_text(encoding="utf-8"))
+    if not isinstance(lido, dict):
+        raise ValueError(f"{caminho}: esperava um objeto JSON de modelo para preço")
+    return dict(
+        _preco(f"{modelo}={','.join(str(v) for v in valores)}") for modelo, valores in lido.items()
+    )
+
+
+def _avisa_precos(medidas: list[dict], precos: dict[str, Preco]) -> None:
+    sem: collections.Counter[str] = collections.Counter()
+    assumidos = set()
+    for medida in medidas:
+        sem.update(medida["sem_preco"])
+        for modelo in medida["modelos"]:
+            casam = [p for p in precos if modelo.startswith(p)]
+            prefixo = max(casam, key=len) if casam else ""
+            if precos.get(prefixo) == PRECO_POR_MTOK.get(prefixo) and prefixo in PRECO_ASSUMIDO:
+                assumidos.add((prefixo, PRECO_ASSUMIDO[prefixo]))
+    for modelo, vezes in sem.most_common():
+        print(
+            f"aviso: sem preço para `{modelo}` ({vezes} requisições): o custo desses agentes fica "
+            f"vazio e a soma, parcial. Passe --preco '{modelo}=ENTRADA,SAIDA' ou {VARIAVEL_PRECOS}.",
+            file=sys.stderr,
+        )
+    for prefixo, origem in sorted(assumidos):
+        print(
+            f"aviso: preço de `{prefixo}` assumido igual a {origem}; confira e passe --preco "
+            "se for outro.",
+            file=sys.stderr,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -347,10 +473,31 @@ def main(argv: list[str] | None = None) -> int:
         help="fração do prazo do Bash a partir da qual a chamada conta como pendurada (0.9)",
     )
     parser.add_argument("--sem-tempo", action="store_true", help="só a tabela de custo")
+    parser.add_argument(
+        "--preco",
+        action="append",
+        type=_preco,
+        default=[],
+        metavar="MODELO=ENTRADA,SAIDA[,LEITURA]",
+        help=(
+            "preço em US$ por MTok para os modelos cujo id começa com MODELO (repita para "
+            "vários); LEITURA é o fator da leitura de cache sobre a entrada (padrão 0.1). Passa "
+            f"por cima da tabela do script e do arquivo JSON de {VARIAVEL_PRECOS}. "
+            "Ex.: --preco claude-fable-5-2=10,50,0.025"
+        ),
+    )
     args = parser.parse_args(argv)
     pares = tuple(args.categoria) + (() if args.so_categorias else CATEGORIAS_DE_COMANDO)
     regras = compila(pares)
-    medidas = [mede(caminho, regras) for caminho in _transcripts(args.transcripts)]
+    precos = dict(PRECO_POR_MTOK)
+    if arquivo := os.environ.get(VARIAVEL_PRECOS):
+        try:
+            precos.update(precos_do_arquivo(Path(arquivo)))
+        except (OSError, ValueError, argparse.ArgumentTypeError) as erro:
+            parser.error(f"{VARIAVEL_PRECOS}={arquivo}: {erro}")
+    precos.update(args.preco)
+    medidas = [mede(caminho, regras, precos) for caminho in _transcripts(args.transcripts)]
+    _avisa_precos(medidas, precos)
     if args.json:
         print(json.dumps(medidas, ensure_ascii=False, indent=1))
         return 0
